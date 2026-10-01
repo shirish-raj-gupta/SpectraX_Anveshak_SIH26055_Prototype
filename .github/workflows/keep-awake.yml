@@ -2,26 +2,28 @@
 #
 # Community Cloud suspends an app that receives no viewer traffic, and nothing
 # inside app.py can prevent that -- the sleep is decided by the host, not the
-# process. The only thing that resets the timer is a request arriving from
-# outside, so this workflow sends one on a schedule.
+# process. When asleep, Streamlit Cloud displays a modal with:
+# "This app has gone to sleep due to inactivity" and a wake button:
+# "Yes, get this app back up!".
 #
-# SETUP (one time): add the app URL as a repository variable named
-# STREAMLIT_APP_URL under Settings > Secrets and variables > Actions > Variables.
-# Without it the job is skipped rather than failing, so a fork does not get
-# red runs it cannot fix.
+# A simple curl GET cannot click this button and does not establish a
+# WebSocket connection (meaning Community Cloud never resets its inactivity
+# timer). This workflow runs a headless browser via Playwright:
+# 1. Navigates to the deployed app URL.
+# 2. If asleep, clicks "Yes, get this app back up!" and waits for container boot.
+# 3. If awake, holds an active WebSocket session to refresh the inactivity timer.
 #
-# CAVEAT worth knowing before a demo: GitHub disables scheduled workflows in a
-# repository with no commits for 60 days, and re-enables them only on a manual
-# push. If ANVESHAK has to be awake on a specific day, run this workflow by
-# hand that morning as well -- the schedule is a convenience, not a guarantee.
+# SETUP (optional override): add the app URL as a repository variable or secret
+# named STREAMLIT_APP_URL under Settings > Secrets and variables > Actions.
+# If unset, it defaults to the deployed prototype URL.
 
 name: Keep demo awake
 
 on:
   schedule:
-    # Every six hours. Community Cloud's inactivity window is longer than this,
-    # so four pings a day leaves room for two consecutive failures.
-    - cron: "0 */6 * * *"
+    # Every three hours. Community Cloud's inactivity window is longer than this,
+    # and running every 3 hours leaves ample margin for GitHub Actions delays.
+    - cron: "0 */3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -33,43 +35,26 @@ concurrency:
 
 jobs:
   ping:
+    name: wake-and-keep-alive
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Ping the demo
-        env:
-          APP_URL: ${{ vars.STREAMLIT_APP_URL }}
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install Playwright
         run: |
-          if [ -z "$APP_URL" ]; then
-            echo "STREAMLIT_APP_URL is not set; nothing to ping."
-            # A green run is otherwise indistinguishable from a real ping, so
-            # say which one happened where the run page shows it.
-            {
-              echo "### Demo NOT pinged"
-              echo ""
-              echo "\`STREAMLIT_APP_URL\` is not set, so this job did nothing."
-              echo "The demo will still sleep. Set the variable under"
-              echo "**Settings > Secrets and variables > Actions > Variables**."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
-          # A sleeping app answers the first request slowly while it wakes, so
-          # a short timeout would report failure exactly when the ping worked.
-          # Three attempts, generous timeout, and only then call it down.
-          for attempt in 1 2 3; do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' \
-                        --max-time 90 --retry 0 "$APP_URL" || echo "000")
-            echo "attempt $attempt -> HTTP $code"
-            if [ "$code" = "200" ]; then
-              echo "Demo is awake."
-              echo "### Demo pinged and awake (HTTP 200 on attempt $attempt)"                 >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            sleep 20
-          done
-
-          echo "::error::$APP_URL did not return 200 after three attempts."
-          echo "The app may have been suspended for longer than a ping can fix;"
-          echo "open it once in a browser to wake it, then this schedule holds it."
-          exit 1
+      - name: Wake and ping demo
+        env:
+          APP_URL: ${{ vars.STREAMLIT_APP_URL || secrets.STREAMLIT_APP_URL || 'https://spectrax-anveshak-sih26055-prototype.streamlit.app/' }}
+        run: |
+          python scripts/keep_awake.py --url "$APP_URL"
